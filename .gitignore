@@ -9,3 +9,6 @@ venv/
 # viewer output / personal state
 *.layout.json
 *.png
+
+#keep the png in examples
+!example/*.png
