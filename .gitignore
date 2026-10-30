@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+#for if you store your svg in this folder
+.svg
+
+# viewer output / personal state
+*.layout.json
+*.png
