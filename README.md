@@ -45,23 +45,23 @@ pip install -r requirements.txt
 ### 1. Export your diagram from Drake
 
 ```python
-import subprocess
+import pydot
 
-svg = subprocess.run(
-    ["dot", "-Tsvg"],
-    input=diagram.GetGraphvizString(max_depth=None),
-    capture_output=True, text=True, check=True,
-).stdout
-open("system_diagram.svg", "w").write(svg)
+#makes the Graphviz string with diagram depth 10
+graph = pydot.graph_from_dot_data(
+  self.diagram.GetGraphvizString(max_depth=10))[0]
+
+#writes it to the svg
+graph.write_svg("system_diagram.svg")
 ```
 
-(Requires Graphviz's `dot` on your `PATH`.)
 
 ### 2. Open it
 
 ```bash
 python drake_diagram_viewer.py system_diagram.svg
 ```
+Or just run it without giving the svg and it will ask for it on startup
 
 ### Headless export
 
