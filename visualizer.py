@@ -41,6 +41,9 @@ The SVG is parsed into blocks (systems), arrows (connections) and diagram boxes
                           to ~/.cache/drake_diagram_viewer/nvim_cursor.json). A word that matches
                           nothing leaves the selection as it was. On by default,
                           toggle with Ctrl+Shift+N (remembered; --cursor FILE overrides the path).
+  * Minimap            -> small overview in the bottom-right corner of the view: every block and
+                          diagram box, the current selection and the visible area. Click or drag
+                          in it to move the view. Toggle with Ctrl+M (remembered).
   * Dark mode (Dracula palette) is the default; toggle with Ctrl+Shift+D (remembered).
 
 Requires:  pip install PySide6      (PyQt6 also works)
@@ -1497,6 +1500,195 @@ class DiagramScene(QtWidgets.QGraphicsScene):
 
 
 # =============================================================================
+# Minimap (overview overlay in the corner of the view)
+# =============================================================================
+class MiniMap(QtWidgets.QWidget):
+    """Small overview of the whole diagram, drawn on top of the view's viewport.
+
+    Shows diagram boxes, blocks (selection / neighbours coloured like in the main view) and
+    the visible area. Left-click or drag moves the main view there."""
+
+    MAX_W, MAX_H, MARGIN = 240, 170, 12
+
+    def __init__(self, view: "DiagramView"):
+        super().__init__(view.viewport())
+        self.view = view
+        self._vis = QRectF()
+        self._world = QRectF(0, 0, 1, 1)
+        self._dragging = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Minimap - click or drag to move the view")
+        self._timer = QtCore.QTimer(
+            self
+        )  # coalesce bursts of scene changes into one repaint
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(40)
+        self._timer.timeout.connect(self._refresh)
+        self.reposition()
+
+    # -- geometry -------------------------------------------------------------
+    def world_rect(self) -> QRectF:
+        sc = self.view.scene()
+        r = sc.content_rect() if sc else QRectF(0, 0, 100, 100)
+        m = max(r.width(), r.height()) * 0.06 + 20
+        return r.adjusted(-m, -m, m, m)
+
+    def _map(self):
+        """(scale, offset) that map scene coordinates to widget coordinates."""
+        w = self._world
+        k = min(
+            self.width() / max(w.width(), 1.0), self.height() / max(w.height(), 1.0)
+        )
+        ox = (self.width() - w.width() * k) / 2 - w.left() * k
+        oy = (self.height() - w.height() * k) / 2 - w.top() * k
+        return k, ox, oy
+
+    def to_widget(self, r: QRectF) -> QRectF:
+        k, ox, oy = self._map()
+        return QRectF(
+            r.left() * k + ox, r.top() * k + oy, r.width() * k, r.height() * k
+        )
+
+    def to_scene(self, p: QPointF) -> QPointF:
+        k, ox, oy = self._map()
+        return QPointF((p.x() - ox) / k, (p.y() - oy) / k)
+
+    def visible_scene_rect(self) -> QRectF:
+        return self.view.mapToScene(self.view.viewport().rect()).boundingRect()
+
+    def reposition(self):
+        """Size follows the diagram's aspect ratio; sits in the bottom-right corner."""
+        self._world = self.world_rect()
+        w, h = self._world.width(), self._world.height()
+        k = min(self.MAX_W / max(w, 1.0), self.MAX_H / max(h, 1.0))
+        W, H = max(80, int(w * k)), max(60, int(h * k))
+        vp = self.view.viewport()
+        self.setGeometry(
+            vp.width() - W - self.MARGIN, vp.height() - H - self.MARGIN, W, H
+        )
+        self.raise_()
+
+    # -- refresh hooks --------------------------------------------------------
+    def schedule(self, *_):
+        if self.isVisible() and not self._timer.isActive():
+            self._timer.start()
+
+    def _refresh(self):
+        self.reposition()
+        self.update()
+
+    def sync_view(self):
+        """Called by the view after each paint: repaint only when the visible area moved."""
+        vis = self.visible_scene_rect()
+        if vis != self._vis:
+            self._vis = vis
+            self.update()
+
+    # -- painting -------------------------------------------------------------
+    def paint_blocks(self, p: QPainter, sc):
+        sel_col, nbr_col = QColor(T.sel_outline), QColor(T.nbr_outline)
+        for b in sc.visible_blocks():
+            r = self.to_widget(b.scene_rect())
+            r = QRectF(r.left(), r.top(), max(r.width(), 2.0), max(r.height(), 2.0))
+            if b.state == "selected":
+                p.setPen(QPen(sel_col, 1.2))
+                p.setBrush(sel_col)
+            elif b.state == "neighbor":
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(nbr_col)
+            else:
+                dim = sc.selection and sc.dim_unrelated
+                col = QColor(b.head_color)
+                col.setAlpha(110 if dim else 230)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(col)
+            p.drawRect(r)
+
+    def paintEvent(self, ev):
+        sc = self.view.scene()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        bg = QColor(T.bg)
+        bg.setAlpha(225)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(bg)
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 6, 6)
+        if sc is None:
+            return
+        p.save()
+        clip = QPainterPath()
+        clip.addRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 5, 5)
+        p.setClipPath(clip)
+
+        for c in sorted(
+            sc.clusters, key=lambda c: c.data.depth
+        ):  # diagram boxes, outermost first
+            if not c.isVisible():
+                continue
+            if c.data.kind == "diagram":
+                fill, edge = T.cluster_fill(c.data.depth), QColor(T.cluster_border)
+            else:
+                fill, edge = QColor(T.port_fill), QColor(T.port_border)
+            p.setPen(QPen(edge, 0.8))
+            p.setBrush(fill)
+            p.drawRect(self.to_widget(c.rect))
+        for g in sc.groups:  # group outlines
+            if g.item is not None and g.item.isVisible():
+                col = QColor(GROUP_COLORS[g.color_idx % len(GROUP_COLORS)])
+                p.setPen(QPen(col, 1.0, Qt.PenStyle.DashLine))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRect(self.to_widget(g.item.rect))
+        self.paint_blocks(p, sc)
+
+        # visible area: everything outside is shaded, the border is the accent colour
+        vis = self.to_widget(self.visible_scene_rect())
+        shade = QPainterPath()
+        shade.addRect(QRectF(self.rect()))
+        hole = QPainterPath()
+        hole.addRect(vis)
+        shade = shade.subtracted(hole)
+        veil = QColor(0, 0, 0, 70 if T.dark else 40)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(veil)
+        p.drawPath(shade)
+        p.setPen(QPen(QColor(T.sel_outline if T.dark else "#1c7ed6"), 1.6))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(vis)
+        p.restore()
+
+        p.setPen(QPen(QColor(T.cluster_border), 1.2))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 6, 6)
+
+    # -- mouse ----------------------------------------------------------------
+    def _goto(self, pos: QPointF):
+        self.view.stop_anim()
+        self.view.centerOn(self.to_scene(pos))
+        self.sync_view()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            self._goto(e.position())
+        e.accept()
+
+    def mouseMoveEvent(self, e):
+        if self._dragging:
+            self._goto(e.position())
+        e.accept()
+
+    def mouseReleaseEvent(self, e):
+        self._dragging = False
+        e.accept()
+
+    def mouseDoubleClickEvent(self, e):
+        e.accept()
+
+    def wheelEvent(self, e):
+        e.accept()  # do not zoom the main view while hovering the minimap
+
+
+# =============================================================================
 # View (all mouse interaction lives here)
 # =============================================================================
 class DiagramView(QtWidgets.QGraphicsView):
@@ -1519,9 +1711,25 @@ class DiagramView(QtWidgets.QGraphicsView):
         self.mode = None
         self._anim = None
         self.rename_cb = lambda group: None
+        self.minimap = MiniMap(self)
         self._band = QtWidgets.QRubberBand(
             QtWidgets.QRubberBand.Shape.Rectangle, self.viewport()
         )
+
+    # -- minimap hooks --------------------------------------------------------
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.minimap.reposition()
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        self.minimap.sync_view()
+
+    def setScene(self, scene):
+        super().setScene(scene)
+        if scene is not None:
+            scene.changed.connect(self.minimap.schedule)
+        self.minimap.schedule()
 
     # -- helpers ------------------------------------------------------------
     def pick(self, vpos: QPoint):
@@ -1961,6 +2169,10 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         dim.setChecked(True)
         self._act("&Controls", "F1", self.show_help, h)
+        self.minimap_act = self._act("&Minimap", "Ctrl+M", self.set_minimap, v, True)
+        show_map = QtCore.QSettings(APP_ORG, APP_NAME).value("minimap", True, type=bool)
+        self.minimap_act.setChecked(show_map)
+        self.view.minimap.setVisible(show_map)
         tog = self.inspector_dock.toggleViewAction()
         tog.setText("&Values inspector")
         tog.setShortcut(QtGui.QKeySequence("Ctrl+I"))
@@ -2001,6 +2213,14 @@ class MainWindow(QtWidgets.QMainWindow):
             QtCore.QSettings(APP_ORG, APP_NAME).value("follow_nvim", True, type=bool)
         )
 
+    def set_minimap(self, on):
+        on = bool(on)
+        QtCore.QSettings(APP_ORG, APP_NAME).setValue("minimap", on)
+        self.view.minimap.setVisible(on)
+        if on:
+            self.view.minimap.reposition()
+            self.view.minimap.update()
+
     # -- theme --------------------------------------------------------------
     def set_dark(self, on):
         on = bool(on)
@@ -2010,6 +2230,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.scene:
             self.scene.apply_theme()
         self.view.viewport().update()
+        self.view.minimap.update()
         self.refresh_inspector()
 
     # -- values inspector -----------------------------------------------------
@@ -2491,6 +2712,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "<b>F5</b> – reload the SVG now (also automatic when the file changes; layout resets, highlight stays)<br>"
                 "<b>Ctrl+Shift+N</b> – follow the word under the Neovim cursor (drake_cursor.lua), on / off<br>"
                 "<b>Ctrl+I</b> – show / hide the values inspector (fed by drake_probe.run_debug)<br>"
+                "<b>Ctrl+M</b> – show / hide the minimap (click or drag in it to move the view)<br>"
                 "<b>Ctrl+Shift+D</b> – dark / light mode"
             ),
         )
